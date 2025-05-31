@@ -28,7 +28,11 @@ def request_username():
 
 
 def main():
+    global app
     app = create_app()
+    # Add generate_download_token to jinja globals after app is initialized
+    from .web import generate_download_token
+    app.jinja_env.globals.update(generate_download_token=generate_download_token)
 
     from .web import web
     from .basic import basic

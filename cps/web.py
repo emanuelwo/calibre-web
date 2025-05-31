@@ -60,6 +60,11 @@ from .services.worker import WorkerThread
 from .tasks_status import render_task_status
 from .usermanagement import user_login_required
 from .string_helper import strip_whitespaces
+import hmac
+import hashlib
+import time
+from functools import wraps
+import base64
 
 
 feature_support = {
@@ -116,6 +121,32 @@ def add_security_headers(resp):
     return resp
 
 
+# Move this section to the top, right after imports but before any app/blueprint usage
+def generate_download_token(user_id, book_id, book_format):
+    """Generate a secure token containing all download information"""
+    timestamp = int(time.time())
+    # Create a payload with all necessary information
+    payload = {
+        'user_id': user_id,
+        'book_id': book_id,
+        'format': book_format.lower(),
+        'timestamp': timestamp
+    }
+    # Encode payload to base64
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    # Create signature of the payload
+    secret_key = app.config['SECRET_KEY']
+    if isinstance(secret_key, str):
+        secret_key = secret_key.encode()
+    signature = hmac.new(
+        secret_key,
+        payload_b64.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    # Return token as payload.signature
+    return f"{payload_b64}.{signature}"
+
+# Then the blueprint definition
 web = Blueprint('web', __name__)
 
 log = logger.create()
@@ -1237,19 +1268,90 @@ def serve_book(book_id, book_format, anyname):
         return response
 
 
-@web.route("/download/<int:book_id>/<book_format>", defaults={'anyname': 'None'})
-@web.route("/download/<int:book_id>/<book_format>/<anyname>")
-@login_required_if_no_ano
-@download_required
-def download_link(book_id, book_format, anyname):
-    if "kindle" in request.headers.get('User-Agent').lower():
+def verify_download_token(token, max_age=300):  # 5 minutes expiry
+    """Verify a download token and return the payload if valid"""
+    try:
+        # Split the token into payload and signature
+        payload_b64, signature = token.split('.')
+        
+        # Get and prepare secret key
+        secret_key = app.config['SECRET_KEY']
+        if isinstance(secret_key, str):
+            secret_key = secret_key.encode()
+            
+        # Verify the signature
+        expected = hmac.new(
+            secret_key,
+            payload_b64.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if not hmac.compare_digest(signature, expected):
+            log.warning("Invalid download token signature")
+            return None
+            
+        # Decode and parse the payload
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
+        
+        # Check if token has expired
+        if time.time() - payload['timestamp'] > max_age:
+            log.warning("Download token expired")
+            return None
+            
+        return payload
+    except Exception as e:
+        log.error("Error verifying download token: %s", str(e))
+        return None
+
+def token_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = request.args.get('token')
+        if not token:
+            log.warning("No download token provided")
+            abort(403)
+            
+        payload = verify_download_token(token)
+        if not payload:
+            log.warning("Invalid download token")
+            abort(403)
+            
+        # Check if user exists and has download permissions
+        user = ub.session.query(ub.User).filter(ub.User.id == payload['user_id']).first()
+        if not user or not user.role_download():
+            log.warning("User %d does not have download permissions", payload['user_id'])
+            abort(403)
+            
+        # Add user and payload to kwargs for the view function
+        kwargs['user'] = user
+        kwargs['book_id'] = payload['book_id']
+        kwargs['book_format'] = payload['format']
+        return f(*args, **kwargs)
+    return decorated_function
+
+@web.route("/download")
+@token_required
+def download_link(user, book_id, book_format):
+    log.info("Download request received - Method: %s, Book ID: %s, Format: %s", 
+             request.method, book_id, book_format)
+    log.info("User Agent: %s", request.headers.get('User-Agent', 'No User-Agent'))
+    
+    if "kindle" in request.headers.get('User-Agent', '').lower():
         client = "kindle"
-    elif "Kobo" in request.headers.get('User-Agent').lower():
+    elif "Kobo" in request.headers.get('User-Agent', '').lower():
         client = "kobo"
+    elif "tolino" in request.headers.get('User-Agent', '').lower():
+        client = "tolino"
     else:
         client = ""
-    return get_download_link(book_id, book_format, client)
-
+        
+    try:
+        response = get_download_link(book_id, book_format, client)
+        log.info("Download link generated successfully for user %d", user.id)
+        return response
+    except Exception as e:
+        log.error("Error generating download link: %s", str(e))
+        raise
 
 @web.route('/send/<int:book_id>/<book_format>/<int:convert>', methods=["POST"])
 @login_required_if_no_ano
